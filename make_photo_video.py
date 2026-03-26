@@ -31,9 +31,9 @@ WIDTH = 1920
 HEIGHT = 1080
 
 # Styling constants
-FONT = cv2.FONT_HERSHEY_SIMPLEX
-FONT_SCALE = 1.7
-FONT_THICKNESS = 3
+FONT = cv2.FONT_HERSHEY_TRIPLEX
+FONT_SCALE = 2.2
+FONT_THICKNESS = 4
 TEXT_COLOR = (255, 255, 255)
 STROKE_COLOR = (0, 0, 0)
 SHADOW_COLOR = (20, 20, 20)
@@ -57,6 +57,83 @@ class MatchResult:
     baby_path: Path
     adult_path: Path
     baby_warning: Optional[str] = None
+
+
+def extract_numeric_id(token: str) -> Optional[str]:
+    """Extract a numeric ID from a token or filename/path token."""
+    candidate = token.strip()
+    if not candidate:
+        return None
+    if candidate.isdigit():
+        return candidate
+
+    # Accept values such as "005606649.jpg" or "images/005606649.png".
+    stem = Path(candidate).stem.strip()
+    if stem.isdigit():
+        return stem
+    return None
+
+
+def choose_name_from_tokens(tokens: Sequence[str], adult_id_token_index: Optional[int]) -> Optional[str]:
+    """Pick a likely person-name field from a tokenized row."""
+    name_candidates: List[Tuple[int, int, str]] = []
+
+    for i, token in enumerate(tokens):
+        if adult_id_token_index is not None and i == adult_id_token_index:
+            continue
+
+        t = token.strip()
+        if not t:
+            continue
+
+        # Skip obvious non-name fields.
+        if extract_numeric_id(t) is not None:
+            continue
+        if Path(t).suffix.lower() in SUPPORTED_EXTENSIONS:
+            continue
+        if "/" in t or "\\" in t:
+            continue
+
+        alpha_chars = sum(ch.isalpha() for ch in t)
+        if alpha_chars == 0:
+            continue
+
+        # Score: higher alphabetic count and later columns (often last/first name fields).
+        name_candidates.append((alpha_chars, i, t))
+
+    if not name_candidates:
+        return None
+
+    # Prefer the strongest textual candidate; break ties by later column index.
+    name_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    best_single = name_candidates[0]
+
+    # If the last two usable columns are textual, combine them as "First Last".
+    usable = sorted(name_candidates, key=lambda x: x[1])
+    if len(usable) >= 2:
+        last = usable[-1]
+        prev = usable[-2]
+        if last[1] == prev[1] + 1:
+            combined = f"{last[2]} {prev[2]}".strip()
+            if len(combined) >= len(best_single[2]):
+                return combined
+
+    return best_single[2]
+
+
+def normalize_display_name(name: str) -> str:
+    """Convert common last-name-first formats into first-name-last for on-screen display/matching."""
+    raw = name.strip()
+    if not raw:
+        return raw
+
+    # "Last, First [Middle]" -> "First [Middle] Last"
+    if "," in raw:
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if len(parts) >= 2:
+            return " ".join(parts[1:] + [parts[0]])
+
+    return raw
 
 
 def parse_args() -> argparse.Namespace:
@@ -97,25 +174,35 @@ def parse_index_file(index_path: Path) -> Tuple[List[IndexRow], List[str], List[
             if not line or line.startswith("#"):
                 continue
 
-            parts = INDEX_SEP_PATTERN.split(line, maxsplit=1)
-            if len(parts) < 3:
-                parse_errors.append(
-                    f"Line {line_no}: unable to parse row (no supported separator found): {line!r}"
-                )
+            # Keep all columns (not only first split) so we can handle spreadsheet-like rows.
+            parts = [p.strip() for p in INDEX_SEP_PATTERN.split(line) if p.strip() and p not in {",", "\t", "|", ":", "="}]
+            if len(parts) < 2:
+                parse_errors.append(f"Line {line_no}: unable to parse row: {line!r}")
                 continue
 
-            name = parts[0].strip()
-            adult_id = parts[2].strip()
+            adult_id = None
+            adult_id_token_index: Optional[int] = None
+            for i, part in enumerate(parts):
+                maybe_id = extract_numeric_id(part)
+                if maybe_id is not None:
+                    adult_id = maybe_id
+                    adult_id_token_index = i
+                    break
+
+            name = choose_name_from_tokens(parts, adult_id_token_index)
+
+            if adult_id is None:
+                parse_errors.append(f"Line {line_no}: no numeric adult ID found in row")
+                continue
 
             if not name:
                 parse_errors.append(f"Line {line_no}: empty name")
                 continue
-            if not adult_id:
-                parse_errors.append(f"Line {line_no}: empty adult ID")
-                continue
 
-            rows.append(IndexRow(line_no=line_no, name=name, adult_id=adult_id))
-            name_counter[normalize_name(name)] += 1
+            display_name = normalize_display_name(name)
+
+            rows.append(IndexRow(line_no=line_no, name=display_name, adult_id=adult_id))
+            name_counter[normalize_name(display_name)] += 1
             id_counter[adult_id] += 1
 
     for normalized_name, count in name_counter.items():
@@ -235,8 +322,6 @@ def prepare_1080p_frame(img_path: Path) -> np.ndarray:
     y1 = (HEIGHT - fg_h) // 2
     out[y1 : y1 + fg_h, x1 : x1 + fg_w] = fg
 
-    # Subtle border to separate foreground from blur.
-    cv2.rectangle(out, (x1, y1), (x1 + fg_w - 1, y1 + fg_h - 1), (255, 255, 255), 1)
     return out
 
 
