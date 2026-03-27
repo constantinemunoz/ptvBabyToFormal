@@ -95,6 +95,8 @@ python make_photo_video.py
   - underscores/hyphens treated like spaces
   - punctuation mostly ignored
   - extra words allowed before/after the name
+  - handles no-space name variants like `JohnSmith_baby.jpg`
+  - handles reversed order variants like `Smith John childhood.png`
 
 If multiple baby candidates match, the script picks the best deterministically and prints a warning.
 
@@ -106,8 +108,8 @@ If multiple baby candidates match, the script picks the best deterministically a
 - Images are not stretched (aspect ratio preserved)
 - Baby photo is transformed (scale/rotate/shift) to align eye positions with the matched adult photo using OpenCV eye detection; adult photo is not modified
 - Baby photo is center-cropped to the same aspect ratio as its matched adult photo before alignment (no squeeze/stretch)
-- Frame style: centered foreground image over blurred full-frame background from same source image
-- Name text appears on a semi-transparent black banner with yellow border (`#FCB315`) at the bottom, starting when the baby->adult fade begins
+- Frame style: centered foreground image over a solid pure-green background (for green-screen/chroma-key workflows)
+- Name text uses Arial Regular (when available) on a semi-transparent black banner with yellow border (`#FCB315`) at the bottom, starting when the baby->adult fade begins
 
 ---
 
