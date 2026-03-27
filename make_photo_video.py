@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 try:
     from tqdm import tqdm
@@ -32,9 +33,9 @@ WIDTH = 1920
 HEIGHT = 1080
 
 # Styling constants
-FONT = cv2.FONT_HERSHEY_TRIPLEX
-FONT_SCALE = 2.2
-FONT_THICKNESS = 4
+# Arial Regular text settings
+FONT_SIZE = 74
+FONT_STROKE_WIDTH = 4
 TEXT_COLOR = (255, 255, 255)
 STROKE_COLOR = (0, 0, 0)
 SHADOW_COLOR = (20, 20, 20)
@@ -46,6 +47,7 @@ BANNER_PADDING_X = 34
 BANNER_PADDING_Y = 20
 BANNER_BORDER_THICKNESS = 3
 BANNER_ALPHA = 0.55
+GREEN_BG_COLOR = (0, 255, 0)  # pure green background for chroma keying
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 INDEX_SEP_PATTERN = re.compile(r"\s*(,|\t|\||:|=)\s*")
@@ -64,6 +66,32 @@ class MatchResult:
     baby_path: Path
     adult_path: Path
     baby_warning: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class BabyCandidate:
+    path: Path
+    normalized_stem: str
+    compact_stem: str
+
+
+def load_arial_font(size: int) -> ImageFont.ImageFont:
+    # Common Arial locations across platforms.
+    candidates = [
+        "arial.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/Arial.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/arial.ttf",
+        "/usr/share/fonts/truetype/microsoft/Arial.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size=size)
+        except Exception:
+            continue
+    # Fallback if Arial is unavailable in runtime environment.
+    return ImageFont.load_default()
 
 
 def load_eye_detector() -> Optional[cv2.CascadeClassifier]:
@@ -298,6 +326,10 @@ def normalize_name(value: str) -> str:
     return cleaned
 
 
+def compact_alnum(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
 def tokenize(value: str) -> List[str]:
     return [token for token in normalize_name(value).split(" ") if token]
 
@@ -363,15 +395,15 @@ def parse_index_file(index_path: Path) -> Tuple[List[IndexRow], List[str], List[
     return rows, parse_errors, duplicate_name_warnings, duplicate_id_warnings
 
 
-def discover_images(images_dir: Path) -> Tuple[Dict[str, Path], Dict[str, str], List[Tuple[Path, str]]]:
+def discover_images(images_dir: Path) -> Tuple[Dict[str, Path], Dict[str, str], List[BabyCandidate]]:
     """Return adult dictionary, adult duplicate warnings, and baby candidate list.
 
     adult_map keys: numeric stem
-    baby_candidates entries: (path, normalized_stem)
+    baby_candidates entries: BabyCandidate(path, normalized_stem, compact_stem)
     """
     adult_map: Dict[str, Path] = {}
     adult_duplicate_warnings: Dict[str, str] = {}
-    baby_candidates: List[Tuple[Path, str]] = []
+    baby_candidates: List[BabyCandidate] = []
 
     for path in sorted(images_dir.rglob("*")):
         if not path.is_file():
@@ -391,34 +423,60 @@ def discover_images(images_dir: Path) -> Tuple[Dict[str, Path], Dict[str, str], 
             else:
                 adult_map[stem] = path
         else:
-            baby_candidates.append((path, normalize_name(stem)))
+            norm_stem = normalize_name(stem)
+            baby_candidates.append(
+                BabyCandidate(path=path, normalized_stem=norm_stem, compact_stem=compact_alnum(stem))
+            )
 
     return adult_map, adult_duplicate_warnings, baby_candidates
 
 
-def choose_best_baby_match(name: str, candidates: Sequence[Tuple[Path, str]]) -> Tuple[Optional[Path], Optional[str]]:
+def choose_best_baby_match(name: str, candidates: Sequence[BabyCandidate]) -> Tuple[Optional[Path], Optional[str]]:
     normalized_name = normalize_name(name)
     name_tokens = tokenize(name)
-    scored: List[Tuple[Tuple[int, int, str], Path]] = []
+    name_compact = compact_alnum(name)
+    reversed_name = " ".join(reversed(name_tokens)).strip()
+    reversed_compact = compact_alnum(reversed_name)
+    scored: List[Tuple[Tuple[int, int, int, int, str], Path]] = []
 
-    for path, normalized_stem in candidates:
+    for candidate in candidates:
+        path = candidate.path
+        normalized_stem = candidate.normalized_stem
+        compact_stem = candidate.compact_stem
         if not normalized_stem:
             continue
 
         contains_full = normalized_name in normalized_stem
+        contains_reversed = bool(reversed_name) and reversed_name in normalized_stem
+        contains_compact = bool(name_compact) and name_compact in compact_stem
+        contains_reversed_compact = bool(reversed_compact) and reversed_compact in compact_stem
+
         token_hits = 0
         if name_tokens:
             stem_tokens = set(normalized_stem.split())
             token_hits = sum(1 for t in name_tokens if t in stem_tokens)
 
-        if not contains_full and token_hits < len(name_tokens):
+        if (
+            not contains_full
+            and not contains_reversed
+            and not contains_compact
+            and not contains_reversed_compact
+            and token_hits < len(name_tokens)
+        ):
             continue
 
         # Lower score tuple is better.
-        # Priority: full-name containment, fewer extra chars, deterministic filename tie-break.
+        # Priority:
+        # 1) direct full-name containment,
+        # 2) compact full-name containment (handles no-space filenames),
+        # 3) reversed-name containment (last-first variants),
+        # 4) fewer extra chars,
+        # 5) deterministic path tie-break.
         extra_chars = max(len(normalized_stem) - len(normalized_name), 0)
-        rank = 0 if contains_full else 1
-        score = (rank, extra_chars, str(path).lower())
+        rank_direct = 0 if contains_full else 1
+        rank_compact = 0 if contains_compact else 1
+        rank_reversed = 0 if (contains_reversed or contains_reversed_compact) else 1
+        score = (rank_direct, rank_compact, rank_reversed, extra_chars, str(path).lower())
         scored.append((score, path))
 
     if not scored:
@@ -443,16 +501,10 @@ def prepare_1080p_frame_from_image(img: np.ndarray) -> np.ndarray:
 
     h, w = img.shape[:2]
     if h == 0 or w == 0:
-        raise ValueError(f"Invalid image dimensions: {img_path}")
+        raise ValueError("Invalid image dimensions")
 
-    # Background: cover frame then blur.
-    scale_bg = max(WIDTH / w, HEIGHT / h)
-    bg_w, bg_h = max(1, int(round(w * scale_bg))), max(1, int(round(h * scale_bg)))
-    bg = cv2.resize(img, (bg_w, bg_h), interpolation=cv2.INTER_LINEAR)
-    x0 = (bg_w - WIDTH) // 2
-    y0 = (bg_h - HEIGHT) // 2
-    bg = bg[y0 : y0 + HEIGHT, x0 : x0 + WIDTH]
-    bg = cv2.GaussianBlur(bg, (0, 0), sigmaX=20, sigmaY=20)
+    # Solid green background for downstream chroma keying.
+    bg = np.full((HEIGHT, WIDTH, 3), GREEN_BG_COLOR, dtype=np.uint8)
 
     # Foreground: contain in frame (no distortion).
     scale_fg = min(WIDTH / w, HEIGHT / h)
@@ -480,7 +532,13 @@ def draw_name_text(frame: np.ndarray, name: str, alpha: float) -> np.ndarray:
         return frame
 
     overlay = frame.copy()
-    (text_w, text_h), baseline = cv2.getTextSize(name, FONT, FONT_SCALE, FONT_THICKNESS)
+    font = load_arial_font(FONT_SIZE)
+    pil_probe = Image.new("RGB", (WIDTH, HEIGHT))
+    probe_draw = ImageDraw.Draw(pil_probe)
+    left, top, right, bottom = probe_draw.textbbox((0, 0), name, font=font, stroke_width=FONT_STROKE_WIDTH)
+    text_w = max(1, right - left)
+    text_h = max(1, bottom - top)
+    baseline = int(text_h * 0.2)
 
     x = max((WIDTH - text_w) // 2, 20)
     y = HEIGHT - SAFE_BOTTOM_MARGIN
@@ -506,42 +564,28 @@ def draw_name_text(frame: np.ndarray, name: str, alpha: float) -> np.ndarray:
     banner_blended = cv2.addWeighted(overlay, BANNER_ALPHA, frame, 1.0 - BANNER_ALPHA, 0)
     overlay = banner_blended.copy()
 
-    # Shadow
-    cv2.putText(
-        overlay,
+    # Draw shadow + stroked text using PIL (Arial Regular when available).
+    pil_overlay = Image.fromarray(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil_overlay)
+    shadow_pos = (x + SHADOW_OFFSET[0], y - text_h + SHADOW_OFFSET[1])
+    text_pos = (x, y - text_h)
+    draw.text(
+        shadow_pos,
         name,
-        (x + SHADOW_OFFSET[0], y + SHADOW_OFFSET[1]),
-        FONT,
-        FONT_SCALE,
-        SHADOW_COLOR,
-        FONT_THICKNESS + 4,
-        cv2.LINE_AA,
+        font=font,
+        fill=SHADOW_COLOR[::-1],  # RGB
+        stroke_width=FONT_STROKE_WIDTH + 1,
+        stroke_fill=STROKE_COLOR[::-1],
     )
-
-    # Stroke (4 directions)
-    for ox, oy in [(-2, 0), (2, 0), (0, -2), (0, 2)]:
-        cv2.putText(
-            overlay,
-            name,
-            (x + ox, y + oy),
-            FONT,
-            FONT_SCALE,
-            STROKE_COLOR,
-            FONT_THICKNESS + 3,
-            cv2.LINE_AA,
-        )
-
-    # Main text
-    cv2.putText(
-        overlay,
+    draw.text(
+        text_pos,
         name,
-        (x, y),
-        FONT,
-        FONT_SCALE,
-        TEXT_COLOR,
-        FONT_THICKNESS,
-        cv2.LINE_AA,
+        font=font,
+        fill=TEXT_COLOR[::-1],  # RGB
+        stroke_width=FONT_STROKE_WIDTH,
+        stroke_fill=STROKE_COLOR[::-1],
     )
+    overlay = cv2.cvtColor(np.array(pil_overlay), cv2.COLOR_RGB2BGR)
 
     return cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0)
 
@@ -568,7 +612,7 @@ def create_writer(output_path: Path) -> cv2.VideoWriter:
 def build_matches(
     rows: Sequence[IndexRow],
     adult_map: Dict[str, Path],
-    baby_candidates: Sequence[Tuple[Path, str]],
+    baby_candidates: Sequence[BabyCandidate],
 ) -> Tuple[List[MatchResult], List[str], List[str]]:
     matches: List[MatchResult] = []
     skipped: List[str] = []
