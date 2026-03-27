@@ -64,12 +64,25 @@ Chris Doe: 00048291
 
 The final video order follows the same row order in `index.txt`.
 
+For spreadsheet-like rows with many columns, the parser will:
+
+- scan all columns and take the **first numeric adult ID** it finds
+- also accept filename/path-style ID fields like `005606649.jpg` (ID extracted as `005606649`)
+- auto-pick the most likely text/name columns (including common `LastName FirstName` trailing columns)
+- convert common last-name-first patterns to on-screen `FirstName LastName`
+
 ---
 
 ## 4) Run
 
 ```bash
 python make_photo_video.py --images ./images --index ./index.txt --output ./final_video.mp4
+```
+
+Or just run with defaults (uses `./images`, `./index.txt`, and writes `./final_video.mp4`):
+
+```bash
+python make_photo_video.py
 ```
 
 ---
@@ -91,8 +104,10 @@ If multiple baby candidates match, the script picks the best deterministically a
 
 - Output: one MP4, 1920x1080, no audio
 - Images are not stretched (aspect ratio preserved)
+- Baby photo is transformed (scale/rotate/shift) to align eye positions with the matched adult photo using OpenCV eye detection; adult photo is not modified
+- Baby photo is center-cropped to the same aspect ratio as its matched adult photo before alignment (no squeeze/stretch)
 - Frame style: centered foreground image over blurred full-frame background from same source image
-- Name text appears at the bottom starting when the baby->adult fade begins
+- Name text appears on a semi-transparent black banner with yellow border (`#FCB315`) at the bottom, starting when the baby->adult fade begins
 
 ---
 
@@ -129,6 +144,9 @@ Check that:
 ### MP4 not playing on one device
 The script attempts codec tags in order: `avc1`, `H264`, then `mp4v`.
 If H.264 encoder is unavailable in your OpenCV build, it may fall back to `mp4v`.
+
+### Eye alignment did not happen for some people
+If eyes cannot be detected in either baby or adult image, the script falls back to center-crop + resize (still preserving aspect ratio and no stretching) and logs a warning in the summary.
 
 ---
 
