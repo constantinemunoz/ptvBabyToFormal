@@ -140,9 +140,24 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate one Full HD MP4 video from baby/adult photo pairs listed in index.txt"
     )
-    parser.add_argument("--images", required=True, type=Path, help="Folder containing images")
-    parser.add_argument("--index", required=True, type=Path, help="Index file linking name -> adult ID")
-    parser.add_argument("--output", required=True, type=Path, help="Output MP4 path")
+    parser.add_argument(
+        "--images",
+        type=Path,
+        default=Path("./images"),
+        help="Folder containing images (default: ./images)",
+    )
+    parser.add_argument(
+        "--index",
+        type=Path,
+        default=Path("./index.txt"),
+        help="Index file linking name -> adult ID (default: ./index.txt)",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("./final_video.mp4"),
+        help="Output MP4 path (default: ./final_video.mp4)",
+    )
     return parser.parse_args()
 
 
