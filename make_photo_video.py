@@ -236,6 +236,14 @@ def detect_primary_face(
     return max(faces, key=lambda f: f[2] * f[3])
 
 
+def infer_eye_centers_from_face(face_box: Tuple[int, int, int, int]) -> Tuple[np.ndarray, np.ndarray]:
+    """Approximate eye centers from a face rectangle when explicit eye detection fails."""
+    x, y, w, h = face_box
+    left = np.array([x + 0.32 * w, y + 0.40 * h], dtype=np.float32)
+    right = np.array([x + 0.68 * w, y + 0.40 * h], dtype=np.float32)
+    return left, right
+
+
 def detect_eye_centers(
     img: np.ndarray,
     eye_detector: cv2.CascadeClassifier,
@@ -315,6 +323,15 @@ def align_baby_to_adult(
     adult_face = detect_primary_face(adult_img, face_detector)
     baby_eyes = detect_eye_centers(baby_cropped, eye_detector, baby_face) if eye_detector else None
     adult_eyes = detect_eye_centers(adult_img, eye_detector, adult_face) if eye_detector else None
+    baby_inferred = False
+    adult_inferred = False
+
+    if baby_eyes is None and baby_face is not None:
+        baby_eyes = infer_eye_centers_from_face(baby_face)
+        baby_inferred = True
+    if adult_eyes is None and adult_face is not None:
+        adult_eyes = infer_eye_centers_from_face(adult_face)
+        adult_inferred = True
 
     if baby_eyes and adult_eyes:
         b_left, b_right = baby_eyes
@@ -337,6 +354,10 @@ def align_baby_to_adult(
             )
         b_angle = math.atan2(float(b_vec[1]), float(b_vec[0]))
         a_angle = math.atan2(float(a_vec[1]), float(a_vec[0]))
+        if baby_inferred or adult_inferred:
+            # Inferred eyes are horizontal by construction; avoid introducing unstable rotation.
+            b_angle = 0.0
+            a_angle = 0.0
         theta = a_angle - b_angle
         cos_t = math.cos(theta) * scale
         sin_t = math.sin(theta) * scale
@@ -353,6 +374,8 @@ def align_baby_to_adult(
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_REFLECT_101,
         )
+        if baby_inferred or adult_inferred:
+            return aligned, "Used inferred eye points from face boxes (explicit eye detection unavailable)."
         return aligned, None
 
     # Face-based fallback (more stable than random eye detections).
