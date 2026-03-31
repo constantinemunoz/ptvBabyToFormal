@@ -28,6 +28,7 @@ except Exception:  # tqdm is optional
 BABY_DURATION = 2.0
 FADE_DURATION = 1.0
 ADULT_DURATION = 2.0
+MISSING_BABY_ADULT_ONLY_DURATION = 3.0
 FPS = 30
 WIDTH = 1920
 HEIGHT = 1080
@@ -48,6 +49,13 @@ BANNER_PADDING_Y = 20
 BANNER_BORDER_THICKNESS = 3
 BANNER_ALPHA = 0.55
 GREEN_BG_COLOR = (0, 255, 0)  # pure green background for chroma keying
+MIN_EYE_DIST_RATIO = 0.12
+MAX_EYE_DIST_RATIO = 0.75
+MAX_EYE_LINE_HEIGHT_RATIO = 0.72
+MIN_ALIGN_SCALE = 0.75
+MAX_ALIGN_SCALE = 1.25
+MIN_FACE_ALIGN_SCALE = 0.80
+MAX_FACE_ALIGN_SCALE = 1.20
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 INDEX_SEP_PATTERN = re.compile(r"\s*(,|\t|\||:|=)\s*")
@@ -63,9 +71,10 @@ class IndexRow:
 @dataclass
 class MatchResult:
     row: IndexRow
-    baby_path: Path
+    baby_path: Optional[Path]
     adult_path: Path
     baby_warning: Optional[str] = None
+    missing_baby: bool = False
 
 
 @dataclass(frozen=True)
@@ -97,6 +106,17 @@ def load_arial_font(size: int) -> ImageFont.ImageFont:
 def load_eye_detector() -> Optional[cv2.CascadeClassifier]:
     try:
         cascade_path = cv2.data.haarcascades + "haarcascade_eye.xml"
+        detector = cv2.CascadeClassifier(cascade_path)
+        if detector.empty():
+            return None
+        return detector
+    except Exception:
+        return None
+
+
+def load_face_detector() -> Optional[cv2.CascadeClassifier]:
+    try:
+        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         detector = cv2.CascadeClassifier(cascade_path)
         if detector.empty():
             return None
@@ -202,15 +222,46 @@ def crop_to_aspect(img: np.ndarray, target_aspect: float) -> np.ndarray:
     return img[y0 : y0 + new_h, :]
 
 
-def detect_eye_centers(img: np.ndarray, eye_detector: cv2.CascadeClassifier) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+def detect_primary_face(
+    img: np.ndarray,
+    face_detector: Optional[cv2.CascadeClassifier],
+) -> Optional[Tuple[int, int, int, int]]:
+    if face_detector is None:
+        return None
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
-    eyes = eye_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(18, 18))
+    faces = face_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(48, 48))
+    if len(faces) == 0:
+        return None
+    return max(faces, key=lambda f: f[2] * f[3])
+
+
+def detect_eye_centers(
+    img: np.ndarray,
+    eye_detector: cv2.CascadeClassifier,
+    face_box: Optional[Tuple[int, int, int, int]] = None,
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+    if face_box is not None:
+        fx, fy, fw, fh = face_box
+        y0 = fy
+        y1 = fy + int(fh * 0.70)  # eyes are typically in upper face area
+        x0 = fx
+        x1 = fx + fw
+        roi = gray[max(y0, 0) : max(y1, 0), max(x0, 0) : max(x1, 0)]
+        if roi.size == 0:
+            return None
+        eyes = eye_detector.detectMultiScale(roi, scaleFactor=1.1, minNeighbors=5, minSize=(14, 14))
+        eyes = [(ex + x0, ey + y0, ew, eh) for (ex, ey, ew, eh) in eyes]
+    else:
+        eyes = eye_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(18, 18))
     if len(eyes) < 2:
         return None
 
     # Pick two largest detections; then sort left-to-right.
     eyes_sorted = sorted(eyes, key=lambda e: e[2] * e[3], reverse=True)[:6]
+    h, w = img.shape[:2]
     best_pair = None
     best_score = float("inf")
     for i in range(len(eyes_sorted)):
@@ -221,8 +272,16 @@ def detect_eye_centers(img: np.ndarray, eye_detector: cv2.CascadeClassifier) -> 
             c2 = np.array([ex2 + ew2 / 2.0, ey2 + eh2 / 2.0], dtype=np.float32)
             if abs(c1[0] - c2[0]) < 10:
                 continue
+            inter_eye_dist = float(np.linalg.norm(c2 - c1))
+            dist_ratio = inter_eye_dist / max(w, 1)
+            avg_y_ratio = ((c1[1] + c2[1]) * 0.5) / max(h, 1)
+            # Reject implausible detections that often cause bad zoom or drift.
+            if dist_ratio < MIN_EYE_DIST_RATIO or dist_ratio > MAX_EYE_DIST_RATIO:
+                continue
+            if avg_y_ratio > MAX_EYE_LINE_HEIGHT_RATIO:
+                continue
             # Penalize large vertical gap to prefer natural eye-line.
-            score = abs(c1[1] - c2[1])
+            score = abs(c1[1] - c2[1]) + (avg_y_ratio * 10.0)
             if score < best_score:
                 best_score = score
                 best_pair = (c1, c2)
@@ -238,6 +297,7 @@ def align_baby_to_adult(
     baby_img: np.ndarray,
     adult_img: np.ndarray,
     eye_detector: Optional[cv2.CascadeClassifier],
+    face_detector: Optional[cv2.CascadeClassifier],
 ) -> Tuple[np.ndarray, Optional[str]]:
     """
     Align baby photo to adult eye position via similarity transform.
@@ -247,49 +307,81 @@ def align_baby_to_adult(
     target_aspect = target_w / max(target_h, 1)
     baby_cropped = crop_to_aspect(baby_img, target_aspect)
 
-    if eye_detector is None:
+    if eye_detector is None and face_detector is None:
         resized = cv2.resize(baby_cropped, (target_w, target_h), interpolation=cv2.INTER_AREA)
-        return resized, "Eye detector unavailable; used center crop fallback."
+        return resized, "Eye/face detector unavailable; used center crop fallback."
 
-    baby_eyes = detect_eye_centers(baby_cropped, eye_detector)
-    adult_eyes = detect_eye_centers(adult_img, eye_detector)
+    baby_face = detect_primary_face(baby_cropped, face_detector)
+    adult_face = detect_primary_face(adult_img, face_detector)
+    baby_eyes = detect_eye_centers(baby_cropped, eye_detector, baby_face) if eye_detector else None
+    adult_eyes = detect_eye_centers(adult_img, eye_detector, adult_face) if eye_detector else None
 
+    if baby_eyes and adult_eyes:
+        b_left, b_right = baby_eyes
+        a_left, a_right = adult_eyes
+
+        b_vec = b_right - b_left
+        a_vec = a_right - a_left
+        b_dist = float(np.linalg.norm(b_vec))
+        a_dist = float(np.linalg.norm(a_vec))
+        if b_dist < 1e-6 or a_dist < 1e-6:
+            resized = cv2.resize(baby_cropped, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            return resized, "Invalid eye geometry; used center crop fallback."
+
+        scale = a_dist / b_dist
+        if scale < MIN_ALIGN_SCALE or scale > MAX_ALIGN_SCALE:
+            resized = cv2.resize(baby_cropped, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            return (
+                resized,
+                f"Eye-based scale {scale:.2f} outside safe range [{MIN_ALIGN_SCALE:.2f}, {MAX_ALIGN_SCALE:.2f}]; used center crop fallback.",
+            )
+        b_angle = math.atan2(float(b_vec[1]), float(b_vec[0]))
+        a_angle = math.atan2(float(a_vec[1]), float(a_vec[0]))
+        theta = a_angle - b_angle
+        cos_t = math.cos(theta) * scale
+        sin_t = math.sin(theta) * scale
+        rot = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=np.float32)
+        trans = a_left - rot @ b_left
+        matrix = np.array(
+            [[rot[0, 0], rot[0, 1], trans[0]], [rot[1, 0], rot[1, 1], trans[1]]],
+            dtype=np.float32,
+        )
+        aligned = cv2.warpAffine(
+            baby_cropped,
+            matrix,
+            (target_w, target_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+        return aligned, None
+
+    # Face-based fallback (more stable than random eye detections).
+    if baby_face is not None and adult_face is not None:
+        bx, by, bw, bh = baby_face
+        ax, ay, aw, ah = adult_face
+        b_center = np.array([bx + bw / 2.0, by + bh / 2.0], dtype=np.float32)
+        a_center = np.array([ax + aw / 2.0, ay + ah / 2.0], dtype=np.float32)
+        scale = (aw / max(bw, 1))
+        scale = float(np.clip(scale, MIN_FACE_ALIGN_SCALE, MAX_FACE_ALIGN_SCALE))
+        matrix = np.array(
+            [[scale, 0.0, a_center[0] - scale * b_center[0]], [0.0, scale, a_center[1] - scale * b_center[1]]],
+            dtype=np.float32,
+        )
+        aligned = cv2.warpAffine(
+            baby_cropped,
+            matrix,
+            (target_w, target_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+        return aligned, "Used face-based alignment fallback (eye pair not reliable)."
+
+    # Last-resort fallback.
     if not baby_eyes or not adult_eyes:
         resized = cv2.resize(baby_cropped, (target_w, target_h), interpolation=cv2.INTER_AREA)
-        return resized, "Eye detection failed for baby/adult; used center crop fallback."
-
-    b_left, b_right = baby_eyes
-    a_left, a_right = adult_eyes
-
-    b_vec = b_right - b_left
-    a_vec = a_right - a_left
-    b_dist = float(np.linalg.norm(b_vec))
-    a_dist = float(np.linalg.norm(a_vec))
-    if b_dist < 1e-6 or a_dist < 1e-6:
-        resized = cv2.resize(baby_cropped, (target_w, target_h), interpolation=cv2.INTER_AREA)
-        return resized, "Invalid eye geometry; used center crop fallback."
-
-    scale = a_dist / b_dist
-    b_angle = math.atan2(float(b_vec[1]), float(b_vec[0]))
-    a_angle = math.atan2(float(a_vec[1]), float(a_vec[0]))
-    theta = a_angle - b_angle
-    cos_t = math.cos(theta) * scale
-    sin_t = math.sin(theta) * scale
-    rot = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=np.float32)
-    trans = a_left - rot @ b_left
-    matrix = np.array(
-        [[rot[0, 0], rot[0, 1], trans[0]], [rot[1, 0], rot[1, 1], trans[1]]],
-        dtype=np.float32,
-    )
-
-    aligned = cv2.warpAffine(
-        baby_cropped,
-        matrix,
-        (target_w, target_h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REFLECT_101,
-    )
-    return aligned, None
+        return resized, "Eye/face detection failed for baby/adult; used center crop fallback."
+    resized = cv2.resize(baby_cropped, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    return resized, "Used center crop fallback."
 
 
 def parse_args() -> argparse.Namespace:
@@ -538,19 +630,17 @@ def draw_name_text(frame: np.ndarray, name: str, alpha: float) -> np.ndarray:
     left, top, right, bottom = probe_draw.textbbox((0, 0), name, font=font, stroke_width=FONT_STROKE_WIDTH)
     text_w = max(1, right - left)
     text_h = max(1, bottom - top)
-    baseline = int(text_h * 0.2)
-
     x = max((WIDTH - text_w) // 2, 20)
-    y = HEIGHT - SAFE_BOTTOM_MARGIN
+    banner_center_y = HEIGHT - SAFE_BOTTOM_MARGIN
 
     # Semi-transparent banner with yellow border behind text.
     top_left = (
         max(x - BANNER_PADDING_X, 10),
-        max(y - text_h - baseline - BANNER_PADDING_Y, 10),
+        max(int(banner_center_y - (text_h / 2) - BANNER_PADDING_Y), 10),
     )
     bottom_right = (
         min(x + text_w + BANNER_PADDING_X, WIDTH - 10),
-        min(y + baseline + BANNER_PADDING_Y, HEIGHT - 10),
+        min(int(banner_center_y + (text_h / 2) + BANNER_PADDING_Y), HEIGHT - 10),
     )
     cv2.rectangle(overlay, top_left, bottom_right, BANNER_FILL_COLOR, thickness=-1)
     cv2.rectangle(
@@ -567,8 +657,12 @@ def draw_name_text(frame: np.ndarray, name: str, alpha: float) -> np.ndarray:
     # Draw shadow + stroked text using PIL (Arial Regular when available).
     pil_overlay = Image.fromarray(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(pil_overlay)
-    shadow_pos = (x + SHADOW_OFFSET[0], y - text_h + SHADOW_OFFSET[1])
-    text_pos = (x, y - text_h)
+    box_w = bottom_right[0] - top_left[0]
+    box_h = bottom_right[1] - top_left[1]
+    text_x = top_left[0] + (box_w - text_w) // 2 - left
+    text_y = top_left[1] + (box_h - text_h) // 2 - top
+    shadow_pos = (text_x + SHADOW_OFFSET[0], text_y + SHADOW_OFFSET[1])
+    text_pos = (text_x, text_y)
     draw.text(
         shadow_pos,
         name,
@@ -619,39 +713,56 @@ def build_matches(
     warnings: List[str] = []
 
     for row in rows:
-        if not row.adult_id.isdigit():
-            skipped.append(
-                f"Line {row.line_no} '{row.name}': adult ID '{row.adult_id}' is not numeric"
-            )
-            continue
-
-        adult_path = adult_map.get(row.adult_id)
-        if adult_path is None:
-            skipped.append(
-                f"Line {row.line_no} '{row.name}': missing adult image for ID '{row.adult_id}'"
-            )
-            continue
-
+        row_reasons: List[str] = []
+        adult_path: Optional[Path] = None
         baby_path, baby_warning = choose_best_baby_match(row.name, baby_candidates)
+        baby_missing_reason: Optional[str] = None
+
+        if not row.adult_id.isdigit():
+            row_reasons.append(f"adult ID '{row.adult_id}' is not numeric")
+        else:
+            adult_path = adult_map.get(row.adult_id)
+            if adult_path is None:
+                row_reasons.append(f"adult photo missing for ID '{row.adult_id}'")
+            elif not adult_path.exists() or not adult_path.is_file():
+                row_reasons.append(f"adult photo path is missing on disk: {adult_path}")
+            else:
+                adult_probe = cv2.imread(str(adult_path), cv2.IMREAD_COLOR)
+                if adult_probe is None:
+                    row_reasons.append(f"adult photo is not readable: {adult_path}")
+
         if baby_path is None:
+            baby_missing_reason = "baby photo missing (no filename match found)"
+            row_reasons.append(baby_missing_reason)
+        elif not baby_path.exists() or not baby_path.is_file():
+            row_reasons.append(f"baby photo path is missing on disk: {baby_path}")
+        else:
+            baby_probe = cv2.imread(str(baby_path), cv2.IMREAD_COLOR)
+            if baby_probe is None:
+                row_reasons.append(f"baby photo is not readable: {baby_path}")
+
+        only_missing_baby = (
+            baby_missing_reason is not None
+            and len(row_reasons) == 1
+            and adult_path is not None
+        )
+        if row_reasons and not only_missing_baby:
             skipped.append(
-                f"Line {row.line_no} '{row.name}': no matching baby image found"
+                f"Line {row.line_no} '{row.name}': skipped because " + "; ".join(row_reasons)
             )
             continue
 
-        if not baby_path.exists():
-            skipped.append(f"Line {row.line_no} '{row.name}': baby file disappeared: {baby_path}")
-            continue
-
-        if not adult_path.exists():
-            skipped.append(f"Line {row.line_no} '{row.name}': adult file disappeared: {adult_path}")
-            continue
-
+        assert adult_path is not None
+        if only_missing_baby:
+            warnings.append(
+                f"Line {row.line_no} '{row.name}': baby photo missing; rendered adult-only segment ({MISSING_BABY_ADULT_ONLY_DURATION:.1f}s)."
+            )
         match = MatchResult(
             row=row,
             baby_path=baby_path,
             adult_path=adult_path,
             baby_warning=baby_warning,
+            missing_baby=only_missing_baby,
         )
         matches.append(match)
         if baby_warning:
@@ -664,21 +775,32 @@ def write_segment(
     writer: cv2.VideoWriter,
     match: MatchResult,
     eye_detector: Optional[cv2.CascadeClassifier],
+    face_detector: Optional[cv2.CascadeClassifier],
     warnings_out: List[str],
-) -> None:
-    baby_img = cv2.imread(str(match.baby_path), cv2.IMREAD_COLOR)
+) -> Optional[str]:
     adult_img = cv2.imread(str(match.adult_path), cv2.IMREAD_COLOR)
-    if baby_img is None:
-        raise ValueError(f"Cannot read baby image: {match.baby_path}")
     if adult_img is None:
-        raise ValueError(f"Cannot read adult image: {match.adult_path}")
+        return f"Line {match.row.line_no} '{match.row.name}': adult photo became unreadable at render time: {match.adult_path}"
 
-    aligned_baby_img, align_warning = align_baby_to_adult(baby_img, adult_img, eye_detector)
+    adult_frame = prepare_1080p_frame_from_image(adult_img)
+    if match.missing_baby:
+        adult_with_text = draw_name_text(adult_frame, match.row.name, alpha=1.0)
+        for _ in range(int(round(MISSING_BABY_ADULT_ONLY_DURATION * FPS))):
+            writer.write(adult_with_text)
+        return None
+
+    if match.baby_path is None:
+        return f"Line {match.row.line_no} '{match.row.name}': internal error: baby path missing for full segment."
+
+    baby_img = cv2.imread(str(match.baby_path), cv2.IMREAD_COLOR)
+    if baby_img is None:
+        return f"Line {match.row.line_no} '{match.row.name}': baby photo became unreadable at render time: {match.baby_path}"
+
+    aligned_baby_img, align_warning = align_baby_to_adult(baby_img, adult_img, eye_detector, face_detector)
     if align_warning:
         warnings_out.append(f"{match.row.name}: {align_warning}")
 
     baby_frame = prepare_1080p_frame_from_image(aligned_baby_img)
-    adult_frame = prepare_1080p_frame_from_image(adult_img)
 
     baby_frames = int(round(BABY_DURATION * FPS))
     fade_frames = int(round(FADE_DURATION * FPS))
@@ -704,6 +826,7 @@ def write_segment(
     adult_with_text = draw_name_text(adult_frame, match.row.name, alpha=1.0)
     for _ in range(adult_frames):
         writer.write(adult_with_text)
+    return None
 
 
 def print_summary(
@@ -756,8 +879,13 @@ def main() -> int:
     matches, skipped, match_warnings = build_matches(rows, adult_map, baby_candidates)
     aggregate_warnings.extend(match_warnings)
     eye_detector = load_eye_detector()
+    face_detector = load_face_detector()
     if eye_detector is None:
-        aggregate_warnings.append("Could not load OpenCV eye detector; using crop fallback for alignment.")
+        aggregate_warnings.append("Could not load OpenCV eye detector.")
+    if face_detector is None:
+        aggregate_warnings.append("Could not load OpenCV face detector.")
+    if eye_detector is None and face_detector is None:
+        aggregate_warnings.append("Both eye and face detectors unavailable; using crop fallback for alignment.")
 
     if not matches:
         print_summary(
@@ -771,20 +899,25 @@ def main() -> int:
         return 2
 
     writer = create_writer(args.output)
+    rendered_matches: List[MatchResult] = []
     try:
         iterator = matches
         if tqdm is not None:
             iterator = tqdm(matches, desc="Rendering", unit="person")
 
         for match in iterator:
-            write_segment(writer, match, eye_detector, aggregate_warnings)
+            render_error = write_segment(writer, match, eye_detector, face_detector, aggregate_warnings)
+            if render_error:
+                skipped.append(render_error)
+                continue
+            rendered_matches.append(match)
     finally:
         writer.release()
 
     print_summary(
         total_rows=len(rows),
         parse_errors=parse_errors,
-        matches=matches,
+        matches=rendered_matches,
         skipped=skipped,
         warnings=aggregate_warnings,
     )
