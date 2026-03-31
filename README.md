@@ -110,6 +110,7 @@ If multiple baby candidates match, the script picks the best deterministically a
 - Baby photo is center-cropped to the same aspect ratio as its matched adult photo before alignment (no squeeze/stretch)
 - Frame style: centered foreground image over a solid pure-green background (for green-screen/chroma-key workflows)
 - Name text uses Arial Regular (when available) on a semi-transparent black banner with yellow border (`#FCB315`) at the bottom, starting when the baby->adult fade begins
+- For entries missing a baby photo match, the person is still rendered with an adult-only segment (3 seconds, no crossfade), and a warning is included in the summary
 
 ---
 
@@ -143,12 +144,18 @@ Check that:
 - Baby filenames contain names (normalized/flexible matching)
 - Files are `.jpg/.jpeg/.png`
 
+The summary now reports detailed per-person skip reasons, including combinations such as:
+- adult missing + baby missing
+- adult unreadable + baby readable
+- baby unreadable + adult readable
+- both unreadable
+
 ### MP4 not playing on one device
 The script attempts codec tags in order: `avc1`, `H264`, then `mp4v`.
 If H.264 encoder is unavailable in your OpenCV build, it may fall back to `mp4v`.
 
 ### Eye alignment did not happen for some people
-If eyes cannot be detected in either baby or adult image, the script falls back to center-crop + resize (still preserving aspect ratio and no stretching) and logs a warning in the summary.
+If eye pairs cannot be detected reliably, the script infers eye points from face boxes and still performs alignment. If face detection is also unavailable, it falls back to center-crop + resize (still preserving aspect ratio and no stretching) and logs a warning in the summary.
 
 ---
 
