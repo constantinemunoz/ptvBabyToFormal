@@ -56,6 +56,7 @@ MIN_ALIGN_SCALE = 0.75
 MAX_ALIGN_SCALE = 1.25
 MIN_FACE_ALIGN_SCALE = 0.80
 MAX_FACE_ALIGN_SCALE = 1.20
+MAX_ALIGNMENT_ANGLE_DEG = 15.0
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 INDEX_SEP_PATTERN = re.compile(r"\s*(,|\t|\||:|=)\s*")
@@ -82,6 +83,86 @@ class BabyCandidate:
     path: Path
     normalized_stem: str
     compact_stem: str
+
+
+@dataclass
+class ContainedForeground:
+    img: np.ndarray
+    x: int
+    y: int
+
+
+class LoopingBackground:
+    def __init__(self, path: Path, width: int, height: int) -> None:
+        self.path = path
+        self.width = width
+        self.height = height
+        self.cap = None
+        if path.exists():
+            cap = cv2.VideoCapture(str(path))
+            if cap.isOpened():
+                self.cap = cap
+
+    def next_frame(self) -> np.ndarray:
+        if self.cap is None:
+            return np.full((self.height, self.width, 3), GREEN_BG_COLOR, dtype=np.uint8)
+        ok, frame = self.cap.read()
+        if not ok or frame is None:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = self.cap.read()
+            if not ok or frame is None:
+                return np.full((self.height, self.width, 3), GREEN_BG_COLOR, dtype=np.uint8)
+        return cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+
+    def release(self) -> None:
+        if self.cap is not None:
+            self.cap.release()
+
+
+class MediaPipeEyeDetector:
+    LEFT_EYE_IDX = 33
+    RIGHT_EYE_IDX = 263
+
+    def __init__(self, model_path: Path) -> None:
+        self.model_path = model_path
+        self.landmarker = None
+        try:
+            import mediapipe as mp  # type: ignore
+
+            BaseOptions = mp.tasks.BaseOptions
+            FaceLandmarker = mp.tasks.vision.FaceLandmarker
+            FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+            VisionRunningMode = mp.tasks.vision.RunningMode
+
+            options = FaceLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=str(model_path)),
+                running_mode=VisionRunningMode.IMAGE,
+                num_faces=1,
+            )
+            self.landmarker = FaceLandmarker.create_from_options(options)
+            self._mp = mp
+        except Exception:
+            self.landmarker = None
+            self._mp = None
+
+    def detect_eye_centers(self, bgr_img: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        if self.landmarker is None or self._mp is None:
+            return None
+        rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
+        mp_image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
+        result = self.landmarker.detect(mp_image)
+        if not result.face_landmarks:
+            return None
+        landmarks = result.face_landmarks[0]
+        h, w = bgr_img.shape[:2]
+        left_lm = landmarks[self.LEFT_EYE_IDX]
+        right_lm = landmarks[self.RIGHT_EYE_IDX]
+        left = np.array([left_lm.x * w, left_lm.y * h], dtype=np.float32)
+        right = np.array([right_lm.x * w, right_lm.y * h], dtype=np.float32)
+        if left[0] > right[0]:
+            # mirrored/unreliable output; caller should fallback.
+            return None
+        return left, right
 
 
 def load_arial_font(size: int) -> ImageFont.ImageFont:
@@ -304,6 +385,7 @@ def detect_eye_centers(
 def align_baby_to_adult(
     baby_img: np.ndarray,
     adult_img: np.ndarray,
+    mp_detector: Optional[MediaPipeEyeDetector],
     eye_detector: Optional[cv2.CascadeClassifier],
     face_detector: Optional[cv2.CascadeClassifier],
 ) -> Tuple[np.ndarray, Optional[str]]:
@@ -321,8 +403,14 @@ def align_baby_to_adult(
 
     baby_face = detect_primary_face(baby_cropped, face_detector)
     adult_face = detect_primary_face(adult_img, face_detector)
-    baby_eyes = detect_eye_centers(baby_cropped, eye_detector, baby_face) if eye_detector else None
-    adult_eyes = detect_eye_centers(adult_img, eye_detector, adult_face) if eye_detector else None
+
+    baby_eyes = mp_detector.detect_eye_centers(baby_cropped) if mp_detector else None
+    adult_eyes = mp_detector.detect_eye_centers(adult_img) if mp_detector else None
+    source = "mediapipe"
+    if baby_eyes is None or adult_eyes is None:
+        baby_eyes = detect_eye_centers(baby_cropped, eye_detector, baby_face) if eye_detector else None
+        adult_eyes = detect_eye_centers(adult_img, eye_detector, adult_face) if eye_detector else None
+        source = "cascade"
     baby_inferred = False
     adult_inferred = False
 
@@ -359,6 +447,11 @@ def align_baby_to_adult(
             b_angle = 0.0
             a_angle = 0.0
         theta = a_angle - b_angle
+        if abs(math.degrees(theta)) > MAX_ALIGNMENT_ANGLE_DEG:
+            resized = cv2.resize(baby_cropped, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            return resized, (
+                f"Eye-based rotation {math.degrees(theta):.1f}° too large; skipped eye alignment to avoid mirrored/unnatural output."
+            )
         cos_t = math.cos(theta) * scale
         sin_t = math.sin(theta) * scale
         rot = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=np.float32)
@@ -376,7 +469,7 @@ def align_baby_to_adult(
         )
         if baby_inferred or adult_inferred:
             return aligned, "Used inferred eye points from face boxes (explicit eye detection unavailable)."
-        return aligned, None
+        return aligned, f"Aligned using {source} eye detection."
 
     # Face-based fallback (more stable than random eye detections).
     if baby_face is not None and adult_face is not None:
@@ -428,6 +521,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("./final_video.mp4"),
         help="Output MP4 path (default: ./final_video.mp4)",
+    )
+    parser.add_argument(
+        "--landmarker-model",
+        type=Path,
+        default=Path("./face_landmarker.task"),
+        help="MediaPipe Face Landmarker model path (default: ./face_landmarker.task)",
     )
     return parser.parse_args()
 
@@ -610,27 +709,28 @@ def choose_best_baby_match(name: str, candidates: Sequence[BabyCandidate]) -> Tu
     return best, warning
 
 
-def prepare_1080p_frame_from_image(img: np.ndarray) -> np.ndarray:
+def prepare_contained_foreground(img: np.ndarray) -> ContainedForeground:
     if img is None:
-        raise ValueError("Cannot prepare frame from empty image")
+        raise ValueError("Cannot prepare foreground from empty image")
 
     h, w = img.shape[:2]
     if h == 0 or w == 0:
         raise ValueError("Invalid image dimensions")
-
-    # Solid green background for downstream chroma keying.
-    bg = np.full((HEIGHT, WIDTH, 3), GREEN_BG_COLOR, dtype=np.uint8)
 
     # Foreground: contain in frame (no distortion).
     scale_fg = min(WIDTH / w, HEIGHT / h)
     fg_w, fg_h = max(1, int(round(w * scale_fg))), max(1, int(round(h * scale_fg)))
     fg = cv2.resize(img, (fg_w, fg_h), interpolation=cv2.INTER_AREA if scale_fg < 1 else cv2.INTER_LINEAR)
 
-    out = bg.copy()
     x1 = (WIDTH - fg_w) // 2
     y1 = (HEIGHT - fg_h) // 2
-    out[y1 : y1 + fg_h, x1 : x1 + fg_w] = fg
+    return ContainedForeground(img=fg, x=x1, y=y1)
 
+
+def compose_with_background(background: np.ndarray, fg: ContainedForeground) -> np.ndarray:
+    out = background.copy()
+    fh, fw = fg.img.shape[:2]
+    out[fg.y : fg.y + fh, fg.x : fg.x + fw] = fg.img
     return out
 
 
@@ -638,7 +738,9 @@ def prepare_1080p_frame(img_path: Path) -> np.ndarray:
     img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
     if img is None:
         raise ValueError(f"Cannot read image: {img_path}")
-    return prepare_1080p_frame_from_image(img)
+    fg = prepare_contained_foreground(img)
+    bg = np.full((HEIGHT, WIDTH, 3), GREEN_BG_COLOR, dtype=np.uint8)
+    return compose_with_background(bg, fg)
 
 
 def draw_name_text(frame: np.ndarray, name: str, alpha: float) -> np.ndarray:
@@ -797,6 +899,8 @@ def build_matches(
 def write_segment(
     writer: cv2.VideoWriter,
     match: MatchResult,
+    background: LoopingBackground,
+    mp_detector: Optional[MediaPipeEyeDetector],
     eye_detector: Optional[cv2.CascadeClassifier],
     face_detector: Optional[cv2.CascadeClassifier],
     warnings_out: List[str],
@@ -805,10 +909,11 @@ def write_segment(
     if adult_img is None:
         return f"Line {match.row.line_no} '{match.row.name}': adult photo became unreadable at render time: {match.adult_path}"
 
-    adult_frame = prepare_1080p_frame_from_image(adult_img)
+    adult_fg = prepare_contained_foreground(adult_img)
     if match.missing_baby:
-        adult_with_text = draw_name_text(adult_frame, match.row.name, alpha=1.0)
         for _ in range(int(round(MISSING_BABY_ADULT_ONLY_DURATION * FPS))):
+            adult_frame = compose_with_background(background.next_frame(), adult_fg)
+            adult_with_text = draw_name_text(adult_frame, match.row.name, alpha=1.0)
             writer.write(adult_with_text)
         return None
 
@@ -819,11 +924,13 @@ def write_segment(
     if baby_img is None:
         return f"Line {match.row.line_no} '{match.row.name}': baby photo became unreadable at render time: {match.baby_path}"
 
-    aligned_baby_img, align_warning = align_baby_to_adult(baby_img, adult_img, eye_detector, face_detector)
+    aligned_baby_img, align_warning = align_baby_to_adult(
+        baby_img, adult_img, mp_detector, eye_detector, face_detector
+    )
     if align_warning:
         warnings_out.append(f"{match.row.name}: {align_warning}")
 
-    baby_frame = prepare_1080p_frame_from_image(aligned_baby_img)
+    baby_fg = prepare_contained_foreground(aligned_baby_img)
 
     baby_frames = int(round(BABY_DURATION * FPS))
     fade_frames = int(round(FADE_DURATION * FPS))
@@ -831,23 +938,29 @@ def write_segment(
 
     # 1) Baby-only section (no text)
     for _ in range(baby_frames):
+        baby_frame = compose_with_background(background.next_frame(), baby_fg)
         writer.write(baby_frame)
 
     # 2) Crossfade with text fade-in
     if fade_frames <= 1:
+        adult_frame = compose_with_background(background.next_frame(), adult_fg)
         blended = adult_frame.copy()
         with_text = draw_name_text(blended, match.row.name, alpha=1.0)
         writer.write(with_text)
     else:
         for i in range(fade_frames):
             alpha = i / (fade_frames - 1)
+            bg = background.next_frame()
+            baby_frame = compose_with_background(bg, baby_fg)
+            adult_frame = compose_with_background(bg, adult_fg)
             blended = cv2.addWeighted(baby_frame, 1.0 - alpha, adult_frame, alpha, 0)
             with_text = draw_name_text(blended, match.row.name, alpha=alpha)
             writer.write(with_text)
 
     # 3) Adult-only section (text fully visible)
-    adult_with_text = draw_name_text(adult_frame, match.row.name, alpha=1.0)
     for _ in range(adult_frames):
+        adult_frame = compose_with_background(background.next_frame(), adult_fg)
+        adult_with_text = draw_name_text(adult_frame, match.row.name, alpha=1.0)
         writer.write(adult_with_text)
     return None
 
@@ -901,6 +1014,18 @@ def main() -> int:
 
     matches, skipped, match_warnings = build_matches(rows, adult_map, baby_candidates)
     aggregate_warnings.extend(match_warnings)
+    mp_detector: Optional[MediaPipeEyeDetector] = None
+    if args.landmarker_model.exists():
+        mp_detector = MediaPipeEyeDetector(args.landmarker_model)
+        if mp_detector.landmarker is None:
+            aggregate_warnings.append(
+                f"MediaPipe Face Landmarker model found but failed to load: {args.landmarker_model}"
+            )
+    else:
+        aggregate_warnings.append(
+            f"MediaPipe Face Landmarker model not found at {args.landmarker_model}; using cascade/face fallback."
+        )
+
     eye_detector = load_eye_detector()
     face_detector = load_face_detector()
     if eye_detector is None:
@@ -922,6 +1047,11 @@ def main() -> int:
         return 2
 
     writer = create_writer(args.output)
+    background = LoopingBackground(args.images / "background.mov", WIDTH, HEIGHT)
+    if background.cap is None:
+        aggregate_warnings.append(
+            f"background.mov was not found/readable at {args.images / 'background.mov'}; using solid background fallback."
+        )
     rendered_matches: List[MatchResult] = []
     try:
         iterator = matches
@@ -929,12 +1059,15 @@ def main() -> int:
             iterator = tqdm(matches, desc="Rendering", unit="person")
 
         for match in iterator:
-            render_error = write_segment(writer, match, eye_detector, face_detector, aggregate_warnings)
+            render_error = write_segment(
+                writer, match, background, mp_detector, eye_detector, face_detector, aggregate_warnings
+            )
             if render_error:
                 skipped.append(render_error)
                 continue
             rendered_matches.append(match)
     finally:
+        background.release()
         writer.release()
 
     print_summary(
