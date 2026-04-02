@@ -119,6 +119,37 @@ class LoopingBackground:
             self.cap.release()
 
 
+def write_video_clip(
+    writer: cv2.VideoWriter,
+    clip_path: Path,
+    loops: int = 1,
+) -> Tuple[bool, str]:
+    if loops <= 0:
+        return True, "no-op"
+    if not clip_path.exists():
+        return False, f"clip not found: {clip_path}"
+
+    cap = cv2.VideoCapture(str(clip_path))
+    if not cap.isOpened():
+        return False, f"clip is not readable: {clip_path}"
+    try:
+        wrote_any = False
+        for _ in range(loops):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            while True:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
+                resized = cv2.resize(frame, (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR)
+                writer.write(resized)
+                wrote_any = True
+        if not wrote_any:
+            return False, f"clip has no readable frames: {clip_path}"
+        return True, "ok"
+    finally:
+        cap.release()
+
+
 class MediaPipeEyeDetector:
     LEFT_EYE_IDX = 33
     RIGHT_EYE_IDX = 263
@@ -1047,13 +1078,19 @@ def main() -> int:
         return 2
 
     writer = create_writer(args.output)
-    background = LoopingBackground(args.images / "background.mov", WIDTH, HEIGHT)
+    background = LoopingBackground(args.images / "background.mp4", WIDTH, HEIGHT)
     if background.cap is None:
         aggregate_warnings.append(
-            f"background.mov was not found/readable at {args.images / 'background.mov'}; using solid background fallback."
+            f"background.mp4 was not found/readable at {args.images / 'background.mp4'}; using solid background fallback."
         )
+    title_card_path = args.images / "titleCard.mp4"
     rendered_matches: List[MatchResult] = []
     try:
+        # Play title card once before portraits.
+        ok, msg = write_video_clip(writer, title_card_path, loops=1)
+        if not ok:
+            aggregate_warnings.append(f"title card start skipped ({msg})")
+
         iterator = matches
         if tqdm is not None:
             iterator = tqdm(matches, desc="Rendering", unit="person")
@@ -1066,6 +1103,11 @@ def main() -> int:
                 skipped.append(render_error)
                 continue
             rendered_matches.append(match)
+
+        # Play title card three times at the end.
+        ok, msg = write_video_clip(writer, title_card_path, loops=3)
+        if not ok:
+            aggregate_warnings.append(f"title card ending skipped ({msg})")
     finally:
         background.release()
         writer.release()
