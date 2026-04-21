@@ -121,6 +121,7 @@ If multiple baby candidates match, the script picks the best deterministically a
 - Adds an additional 10-frame inter-segment cross dissolve from each adult photo to the next person's baby photo
 - Uses a fixed-size black banner with a single yellow top line (no per-name box resizing), centered in the same position each time
 - Uses one uniform font size for all names, chosen so the longest name fits the frame width
+- If eye-based alignment introduces too much black space after transform, the script skips eye alignment for that row and uses a safer fallback
 
 ---
 
