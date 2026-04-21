@@ -46,7 +46,6 @@ BANNER_FILL_COLOR = (0, 0, 0)  # black
 BANNER_BORDER_COLOR = (21, 179, 252)  # #FCB315 in BGR
 BANNER_PADDING_X = 34
 BANNER_PADDING_Y = 20
-BANNER_BORDER_THICKNESS = 3
 BANNER_ALPHA = 0.55
 GREEN_BG_COLOR = (0, 255, 0)  # pure green background for chroma keying
 MIN_EYE_DIST_RATIO = 0.12
@@ -57,6 +56,8 @@ MAX_ALIGN_SCALE = 1.25
 MIN_FACE_ALIGN_SCALE = 0.80
 MAX_FACE_ALIGN_SCALE = 1.20
 MAX_ALIGNMENT_ANGLE_DEG = 15.0
+INTER_SEGMENT_FADE_FRAMES = 10
+BANNER_HEIGHT = 140
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 INDEX_SEP_PATTERN = re.compile(r"\s*(,|\t|\||:|=)\s*")
@@ -213,6 +214,30 @@ def load_arial_font(size: int) -> ImageFont.ImageFont:
             continue
     # Fallback if Arial is unavailable in runtime environment.
     return ImageFont.load_default()
+
+
+def choose_uniform_font_size(names: Sequence[str], max_text_width: int) -> int:
+    if not names:
+        return FONT_SIZE
+    probe = Image.new("RGB", (WIDTH, HEIGHT))
+    draw = ImageDraw.Draw(probe)
+    lo, hi = 20, 120
+    best = lo
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        font = load_arial_font(mid)
+        too_wide = False
+        for n in names:
+            l, t, r, b = draw.textbbox((0, 0), n, font=font, stroke_width=FONT_STROKE_WIDTH)
+            if (r - l) > max_text_width:
+                too_wide = True
+                break
+        if too_wide:
+            hi = mid - 1
+        else:
+            best = mid
+            lo = mid + 1
+    return best
 
 
 def load_eye_detector() -> Optional[cv2.CascadeClassifier]:
@@ -496,7 +521,8 @@ def align_baby_to_adult(
             matrix,
             (target_w, target_h),
             flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REFLECT_101,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
         )
         if baby_inferred or adult_inferred:
             return aligned, "Used inferred eye points from face boxes (explicit eye detection unavailable)."
@@ -519,7 +545,8 @@ def align_baby_to_adult(
             matrix,
             (target_w, target_h),
             flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REFLECT_101,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
         )
         return aligned, "Used face-based alignment fallback (eye pair not reliable)."
 
@@ -682,7 +709,7 @@ def choose_best_baby_match(name: str, candidates: Sequence[BabyCandidate]) -> Tu
     name_compact = compact_alnum(name)
     reversed_name = " ".join(reversed(name_tokens)).strip()
     reversed_compact = compact_alnum(reversed_name)
-    scored: List[Tuple[Tuple[int, int, int, int, str], Path]] = []
+    scored: List[Tuple[Tuple[int, int, int, int, int, str], Path]] = []
 
     for candidate in candidates:
         path = candidate.path
@@ -695,6 +722,8 @@ def choose_best_baby_match(name: str, candidates: Sequence[BabyCandidate]) -> Tu
         contains_reversed = bool(reversed_name) and reversed_name in normalized_stem
         contains_compact = bool(name_compact) and name_compact in compact_stem
         contains_reversed_compact = bool(reversed_compact) and reversed_compact in compact_stem
+        token_compacts = [compact_alnum(t) for t in name_tokens if compact_alnum(t)]
+        contains_all_tokens_compact = bool(token_compacts) and all(t in compact_stem for t in token_compacts)
 
         token_hits = 0
         if name_tokens:
@@ -706,6 +735,7 @@ def choose_best_baby_match(name: str, candidates: Sequence[BabyCandidate]) -> Tu
             and not contains_reversed
             and not contains_compact
             and not contains_reversed_compact
+            and not contains_all_tokens_compact
             and token_hits < len(name_tokens)
         ):
             continue
@@ -721,7 +751,8 @@ def choose_best_baby_match(name: str, candidates: Sequence[BabyCandidate]) -> Tu
         rank_direct = 0 if contains_full else 1
         rank_compact = 0 if contains_compact else 1
         rank_reversed = 0 if (contains_reversed or contains_reversed_compact) else 1
-        score = (rank_direct, rank_compact, rank_reversed, extra_chars, str(path).lower())
+        rank_all_tokens = 0 if contains_all_tokens_compact else 1
+        score = (rank_direct, rank_compact, rank_reversed, rank_all_tokens, extra_chars, str(path).lower())
         scored.append((score, path))
 
     if not scored:
@@ -774,7 +805,12 @@ def prepare_1080p_frame(img_path: Path) -> np.ndarray:
     return compose_with_background(bg, fg)
 
 
-def draw_name_text(frame: np.ndarray, name: str, alpha: float) -> np.ndarray:
+def draw_name_text(
+    frame: np.ndarray,
+    name: str,
+    alpha: float,
+    banner_rect: Optional[Tuple[int, int, int, int]] = None,
+) -> np.ndarray:
     alpha = float(np.clip(alpha, 0.0, 1.0))
     if alpha <= 0:
         return frame
@@ -786,25 +822,21 @@ def draw_name_text(frame: np.ndarray, name: str, alpha: float) -> np.ndarray:
     left, top, right, bottom = probe_draw.textbbox((0, 0), name, font=font, stroke_width=FONT_STROKE_WIDTH)
     text_w = max(1, right - left)
     text_h = max(1, bottom - top)
-    x = max((WIDTH - text_w) // 2, 20)
-    banner_center_y = HEIGHT - SAFE_BOTTOM_MARGIN
-
-    # Semi-transparent banner with yellow border behind text.
-    top_left = (
-        max(x - BANNER_PADDING_X, 10),
-        max(int(banner_center_y - (text_h / 2) - BANNER_PADDING_Y), 10),
-    )
-    bottom_right = (
-        min(x + text_w + BANNER_PADDING_X, WIDTH - 10),
-        min(int(banner_center_y + (text_h / 2) + BANNER_PADDING_Y), HEIGHT - 10),
-    )
+    if banner_rect is None:
+        rect_x = 0
+        rect_w = WIDTH
+    else:
+        rect_x, _, rect_w, _ = banner_rect
+    banner_y = HEIGHT - SAFE_BOTTOM_MARGIN - (BANNER_HEIGHT // 2)
+    top_left = (rect_x, max(banner_y, 0))
+    bottom_right = (min(rect_x + rect_w, WIDTH), min(banner_y + BANNER_HEIGHT, HEIGHT))
     cv2.rectangle(overlay, top_left, bottom_right, BANNER_FILL_COLOR, thickness=-1)
-    cv2.rectangle(
+    cv2.line(
         overlay,
-        top_left,
-        bottom_right,
+        (top_left[0], top_left[1]),
+        (bottom_right[0], top_left[1]),
         BANNER_BORDER_COLOR,
-        thickness=BANNER_BORDER_THICKNESS,
+        thickness=3,
     )
 
     banner_blended = cv2.addWeighted(overlay, BANNER_ALPHA, frame, 1.0 - BANNER_ALPHA, 0)
@@ -935,25 +967,36 @@ def write_segment(
     eye_detector: Optional[cv2.CascadeClassifier],
     face_detector: Optional[cv2.CascadeClassifier],
     warnings_out: List[str],
-) -> Optional[str]:
+    previous_adult_fg: Optional[ContainedForeground],
+) -> Tuple[Optional[str], Optional[ContainedForeground]]:
     adult_img = cv2.imread(str(match.adult_path), cv2.IMREAD_COLOR)
     if adult_img is None:
-        return f"Line {match.row.line_no} '{match.row.name}': adult photo became unreadable at render time: {match.adult_path}"
+        return (
+            f"Line {match.row.line_no} '{match.row.name}': adult photo became unreadable at render time: {match.adult_path}",
+            previous_adult_fg,
+        )
 
     adult_fg = prepare_contained_foreground(adult_img)
+    banner_rect = (adult_fg.x, adult_fg.y, adult_fg.img.shape[1], adult_fg.img.shape[0])
     if match.missing_baby:
         for _ in range(int(round(MISSING_BABY_ADULT_ONLY_DURATION * FPS))):
             adult_frame = compose_with_background(background.next_frame(), adult_fg)
-            adult_with_text = draw_name_text(adult_frame, match.row.name, alpha=1.0)
+            adult_with_text = draw_name_text(adult_frame, match.row.name, alpha=1.0, banner_rect=banner_rect)
             writer.write(adult_with_text)
-        return None
+        return None, adult_fg
 
     if match.baby_path is None:
-        return f"Line {match.row.line_no} '{match.row.name}': internal error: baby path missing for full segment."
+        return (
+            f"Line {match.row.line_no} '{match.row.name}': internal error: baby path missing for full segment.",
+            adult_fg,
+        )
 
     baby_img = cv2.imread(str(match.baby_path), cv2.IMREAD_COLOR)
     if baby_img is None:
-        return f"Line {match.row.line_no} '{match.row.name}': baby photo became unreadable at render time: {match.baby_path}"
+        return (
+            f"Line {match.row.line_no} '{match.row.name}': baby photo became unreadable at render time: {match.baby_path}",
+            adult_fg,
+        )
 
     aligned_baby_img, align_warning = align_baby_to_adult(
         baby_img, adult_img, mp_detector, eye_detector, face_detector
@@ -962,6 +1005,14 @@ def write_segment(
         warnings_out.append(f"{match.row.name}: {align_warning}")
 
     baby_fg = prepare_contained_foreground(aligned_baby_img)
+
+    if previous_adult_fg is not None:
+        for i in range(1, INTER_SEGMENT_FADE_FRAMES + 1):
+            alpha = i / INTER_SEGMENT_FADE_FRAMES
+            bg = background.next_frame()
+            prev_frame = compose_with_background(bg, previous_adult_fg)
+            next_frame = compose_with_background(bg, baby_fg)
+            writer.write(cv2.addWeighted(prev_frame, 1.0 - alpha, next_frame, alpha, 0))
 
     baby_frames = int(round(BABY_DURATION * FPS))
     fade_frames = int(round(FADE_DURATION * FPS))
@@ -976,7 +1027,7 @@ def write_segment(
     if fade_frames <= 1:
         adult_frame = compose_with_background(background.next_frame(), adult_fg)
         blended = adult_frame.copy()
-        with_text = draw_name_text(blended, match.row.name, alpha=1.0)
+        with_text = draw_name_text(blended, match.row.name, alpha=1.0, banner_rect=banner_rect)
         writer.write(with_text)
     else:
         for i in range(fade_frames):
@@ -985,15 +1036,15 @@ def write_segment(
             baby_frame = compose_with_background(bg, baby_fg)
             adult_frame = compose_with_background(bg, adult_fg)
             blended = cv2.addWeighted(baby_frame, 1.0 - alpha, adult_frame, alpha, 0)
-            with_text = draw_name_text(blended, match.row.name, alpha=alpha)
+            with_text = draw_name_text(blended, match.row.name, alpha=alpha, banner_rect=banner_rect)
             writer.write(with_text)
 
     # 3) Adult-only section (text fully visible)
     for _ in range(adult_frames):
         adult_frame = compose_with_background(background.next_frame(), adult_fg)
-        adult_with_text = draw_name_text(adult_frame, match.row.name, alpha=1.0)
+        adult_with_text = draw_name_text(adult_frame, match.row.name, alpha=1.0, banner_rect=banner_rect)
         writer.write(adult_with_text)
-    return None
+    return None, adult_fg
 
 
 def print_summary(
@@ -1025,6 +1076,7 @@ def print_summary(
 
 
 def main() -> int:
+    global FONT_SIZE
     args = parse_args()
 
     if not args.images.exists() or not args.images.is_dir():
@@ -1077,14 +1129,17 @@ def main() -> int:
         print("\nNo valid pairs to render. Exiting without creating video.")
         return 2
 
+    FONT_SIZE = choose_uniform_font_size([m.row.name for m in matches], max_text_width=WIDTH - 80)
+
     writer = create_writer(args.output)
-    background = LoopingBackground(args.images / "background.mp4", WIDTH, HEIGHT)
+    background = LoopingBackground(args.images / "background.mov", WIDTH, HEIGHT)
     if background.cap is None:
         aggregate_warnings.append(
-            f"background.mp4 was not found/readable at {args.images / 'background.mp4'}; using solid background fallback."
+            f"background.mov was not found/readable at {args.images / 'background.mov'}; using solid background fallback."
         )
     title_card_path = args.images / "titleCard.mp4"
     rendered_matches: List[MatchResult] = []
+    previous_adult_fg: Optional[ContainedForeground] = None
     try:
         # Play title card once before portraits.
         ok, msg = write_video_clip(writer, title_card_path, loops=1)
@@ -1096,8 +1151,15 @@ def main() -> int:
             iterator = tqdm(matches, desc="Rendering", unit="person")
 
         for match in iterator:
-            render_error = write_segment(
-                writer, match, background, mp_detector, eye_detector, face_detector, aggregate_warnings
+            render_error, previous_adult_fg = write_segment(
+                writer,
+                match,
+                background,
+                mp_detector,
+                eye_detector,
+                face_detector,
+                aggregate_warnings,
+                previous_adult_fg,
             )
             if render_error:
                 skipped.append(render_error)
