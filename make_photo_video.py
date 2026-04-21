@@ -251,6 +251,23 @@ def choose_uniform_font_size(names: Sequence[str], max_text_width: int) -> int:
     return best
 
 
+def fit_font_for_name(name: str, max_width: int, max_size: int) -> ImageFont.ImageFont:
+    probe = Image.new("RGB", (WIDTH, HEIGHT))
+    draw = ImageDraw.Draw(probe)
+    lo, hi = 16, max(16, max_size)
+    best = load_arial_font(lo)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        font = load_arial_font(mid)
+        l, t, r, b = draw.textbbox((0, 0), name, font=font, stroke_width=FONT_STROKE_WIDTH)
+        if (r - l) <= max_width:
+            best = font
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
 def load_eye_detector() -> Optional[cv2.CascadeClassifier]:
     try:
         cascade_path = cv2.data.haarcascades + "haarcascade_eye.xml"
@@ -461,7 +478,7 @@ def align_baby_to_adult(
     Adult image is never modified.
     """
     target_h, target_w = adult_img.shape[:2]
-    target_aspect = WIDTH / HEIGHT
+    target_aspect = target_w / max(target_h, 1)
     baby_cropped = crop_to_aspect(baby_img, target_aspect)
     normal_fallback = baby_img.copy()
 
@@ -743,7 +760,7 @@ def choose_best_baby_match(name: str, candidates: Sequence[BabyCandidate]) -> Tu
     return best, warning
 
 
-def prepare_contained_foreground(img: np.ndarray) -> ContainedForeground:
+def prepare_contained_foreground(img: np.ndarray, target_aspect: Optional[float] = None) -> ContainedForeground:
     if img is None:
         raise ValueError("Cannot prepare foreground from empty image")
 
@@ -751,11 +768,16 @@ def prepare_contained_foreground(img: np.ndarray) -> ContainedForeground:
     if h == 0 or w == 0:
         raise ValueError("Invalid image dimensions")
 
-    # Enforce one consistent output ratio for every image by center-cropping to 16:9,
-    # then filling the full frame (no edges/letterbox visible).
-    cropped = crop_to_aspect(img, WIDTH / HEIGHT)
-    fg = cv2.resize(cropped, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA if cropped.shape[1] > WIDTH else cv2.INTER_LINEAR)
-    return ContainedForeground(img=fg, x=0, y=0)
+    # Optionally crop to a target ratio (e.g. matched senior/adult ratio), then
+    # fit into frame without distortion.
+    working = crop_to_aspect(img, target_aspect) if target_aspect else img
+    wh, ww = working.shape[:2]
+    scale_fg = min(WIDTH / ww, HEIGHT / wh)
+    fg_w, fg_h = max(1, int(round(ww * scale_fg))), max(1, int(round(wh * scale_fg)))
+    fg = cv2.resize(working, (fg_w, fg_h), interpolation=cv2.INTER_AREA if scale_fg < 1 else cv2.INTER_LINEAR)
+    x1 = (WIDTH - fg_w) // 2
+    y1 = (HEIGHT - fg_h) // 2
+    return ContainedForeground(img=fg, x=x1, y=y1)
 
 
 def compose_with_background(background: np.ndarray, fg: ContainedForeground) -> np.ndarray:
@@ -785,13 +807,6 @@ def draw_name_text(
         return frame
 
     overlay = frame.copy()
-    font = load_arial_font(FONT_SIZE)
-    pil_probe = Image.new("RGB", (WIDTH, HEIGHT))
-    probe_draw = ImageDraw.Draw(pil_probe)
-    left, top, right, bottom = probe_draw.textbbox((0, 0), name, font=font, stroke_width=FONT_STROKE_WIDTH)
-    text_w = max(1, right - left)
-    ascent, descent = font.getmetrics() if hasattr(font, "getmetrics") else (text_w, int(text_w * 0.2))
-    text_h = max(1, ascent + descent)
     if banner_rect is None:
         rect_x = 0
         rect_w = WIDTH
@@ -800,6 +815,16 @@ def draw_name_text(
     banner_y = HEIGHT - SAFE_BOTTOM_MARGIN - (BANNER_HEIGHT // 2)
     top_left = (rect_x, max(banner_y, 0))
     bottom_right = (min(rect_x + rect_w, WIDTH), min(banner_y + BANNER_HEIGHT, HEIGHT))
+
+    # Fit text per-name to stay inside banner/image bounds while honoring the global max size.
+    text_max_width = max(20, (bottom_right[0] - top_left[0]) - 40)
+    font = fit_font_for_name(name, max_width=text_max_width, max_size=FONT_SIZE)
+    pil_probe = Image.new("RGB", (WIDTH, HEIGHT))
+    probe_draw = ImageDraw.Draw(pil_probe)
+    left, top, right, bottom = probe_draw.textbbox((0, 0), name, font=font, stroke_width=FONT_STROKE_WIDTH)
+    text_w = max(1, right - left)
+    ascent, descent = font.getmetrics() if hasattr(font, "getmetrics") else (text_w, int(text_w * 0.2))
+    text_h = max(1, ascent + descent)
     cv2.rectangle(overlay, top_left, bottom_right, BANNER_FILL_COLOR, thickness=-1)
     cv2.line(
         overlay,
@@ -948,7 +973,9 @@ def write_segment(
             previous_adult_fg,
         )
 
-    adult_fg = prepare_contained_foreground(adult_img)
+    adult_h, adult_w = adult_img.shape[:2]
+    adult_aspect = adult_w / max(adult_h, 1)
+    adult_fg = prepare_contained_foreground(adult_img, target_aspect=adult_aspect)
     banner_rect = (adult_fg.x, adult_fg.y, adult_fg.img.shape[1], adult_fg.img.shape[0])
     if match.missing_baby:
         for _ in range(int(round(MISSING_BABY_ADULT_ONLY_DURATION * FPS))):
@@ -976,7 +1003,7 @@ def write_segment(
     if align_warning:
         warnings_out.append(f"{match.row.name}: {align_warning}")
 
-    baby_fg = prepare_contained_foreground(aligned_baby_img)
+    baby_fg = prepare_contained_foreground(aligned_baby_img, target_aspect=adult_aspect)
 
     if previous_adult_fg is not None:
         for i in range(1, INTER_SEGMENT_FADE_FRAMES + 1):
