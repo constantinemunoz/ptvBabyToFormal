@@ -461,7 +461,7 @@ def align_baby_to_adult(
     Adult image is never modified.
     """
     target_h, target_w = adult_img.shape[:2]
-    target_aspect = target_w / max(target_h, 1)
+    target_aspect = WIDTH / HEIGHT
     baby_cropped = crop_to_aspect(baby_img, target_aspect)
     normal_fallback = baby_img.copy()
 
@@ -751,14 +751,11 @@ def prepare_contained_foreground(img: np.ndarray) -> ContainedForeground:
     if h == 0 or w == 0:
         raise ValueError("Invalid image dimensions")
 
-    # Foreground: contain in frame (no distortion).
-    scale_fg = min(WIDTH / w, HEIGHT / h)
-    fg_w, fg_h = max(1, int(round(w * scale_fg))), max(1, int(round(h * scale_fg)))
-    fg = cv2.resize(img, (fg_w, fg_h), interpolation=cv2.INTER_AREA if scale_fg < 1 else cv2.INTER_LINEAR)
-
-    x1 = (WIDTH - fg_w) // 2
-    y1 = (HEIGHT - fg_h) // 2
-    return ContainedForeground(img=fg, x=x1, y=y1)
+    # Enforce one consistent output ratio for every image by center-cropping to 16:9,
+    # then filling the full frame (no edges/letterbox visible).
+    cropped = crop_to_aspect(img, WIDTH / HEIGHT)
+    fg = cv2.resize(cropped, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA if cropped.shape[1] > WIDTH else cv2.INTER_LINEAR)
+    return ContainedForeground(img=fg, x=0, y=0)
 
 
 def compose_with_background(background: np.ndarray, fg: ContainedForeground) -> np.ndarray:
