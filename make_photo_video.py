@@ -463,10 +463,10 @@ def align_baby_to_adult(
     target_h, target_w = adult_img.shape[:2]
     target_aspect = target_w / max(target_h, 1)
     baby_cropped = crop_to_aspect(baby_img, target_aspect)
+    normal_fallback = baby_img.copy()
 
     if eye_detector is None and face_detector is None:
-        resized = cv2.resize(baby_cropped, (target_w, target_h), interpolation=cv2.INTER_AREA)
-        return resized, "Eye/face detector unavailable; used center crop fallback."
+        return normal_fallback, "Eye/face detector unavailable; used normal (non-eye) scaling."
 
     baby_face = detect_primary_face(baby_cropped, face_detector)
     adult_face = detect_primary_face(adult_img, face_detector)
@@ -478,15 +478,6 @@ def align_baby_to_adult(
         baby_eyes = detect_eye_centers(baby_cropped, eye_detector, baby_face) if eye_detector else None
         adult_eyes = detect_eye_centers(adult_img, eye_detector, adult_face) if eye_detector else None
         source = "cascade"
-    baby_inferred = False
-    adult_inferred = False
-
-    if baby_eyes is None and baby_face is not None:
-        baby_eyes = infer_eye_centers_from_face(baby_face)
-        baby_inferred = True
-    if adult_eyes is None and adult_face is not None:
-        adult_eyes = infer_eye_centers_from_face(adult_face)
-        adult_inferred = True
 
     if baby_eyes and adult_eyes:
         b_left, b_right = baby_eyes
@@ -497,26 +488,19 @@ def align_baby_to_adult(
         b_dist = float(np.linalg.norm(b_vec))
         a_dist = float(np.linalg.norm(a_vec))
         if b_dist < 1e-6 or a_dist < 1e-6:
-            resized = cv2.resize(baby_cropped, (target_w, target_h), interpolation=cv2.INTER_AREA)
-            return resized, "Invalid eye geometry; used center crop fallback."
+            return normal_fallback, "Invalid eye geometry; used normal (non-eye) scaling."
 
         scale = a_dist / b_dist
         if scale < MIN_ALIGN_SCALE or scale > MAX_ALIGN_SCALE:
-            resized = cv2.resize(baby_cropped, (target_w, target_h), interpolation=cv2.INTER_AREA)
             return (
-                resized,
+                normal_fallback,
                 f"Eye-based scale {scale:.2f} outside safe range [{MIN_ALIGN_SCALE:.2f}, {MAX_ALIGN_SCALE:.2f}]; used center crop fallback.",
             )
         b_angle = math.atan2(float(b_vec[1]), float(b_vec[0]))
         a_angle = math.atan2(float(a_vec[1]), float(a_vec[0]))
-        if baby_inferred or adult_inferred:
-            # Inferred eyes are horizontal by construction; avoid introducing unstable rotation.
-            b_angle = 0.0
-            a_angle = 0.0
         theta = a_angle - b_angle
         if abs(math.degrees(theta)) > MAX_ALIGNMENT_ANGLE_DEG:
-            resized = cv2.resize(baby_cropped, (target_w, target_h), interpolation=cv2.INTER_AREA)
-            return resized, (
+            return normal_fallback, (
                 f"Eye-based rotation {math.degrees(theta):.1f}° too large; skipped eye alignment to avoid mirrored/unnatural output."
             )
         cos_t = math.cos(theta) * scale
@@ -538,43 +522,12 @@ def align_baby_to_adult(
         black_mask = np.all(aligned < 8, axis=2)
         black_ratio = float(np.mean(black_mask))
         if black_ratio > ALIGN_BLACK_SPACE_THRESHOLD:
-            resized = cv2.resize(baby_cropped, (target_w, target_h), interpolation=cv2.INTER_AREA)
             return (
-                resized,
+                normal_fallback,
                 f"Eye alignment introduced {black_ratio*100:.1f}% black space; used non-eye fallback.",
             )
-        if baby_inferred or adult_inferred:
-            return aligned, "Used inferred eye points from face boxes (explicit eye detection unavailable)."
         return aligned, f"Aligned using {source} eye detection."
-
-    # Face-based fallback (more stable than random eye detections).
-    if baby_face is not None and adult_face is not None:
-        bx, by, bw, bh = baby_face
-        ax, ay, aw, ah = adult_face
-        b_center = np.array([bx + bw / 2.0, by + bh / 2.0], dtype=np.float32)
-        a_center = np.array([ax + aw / 2.0, ay + ah / 2.0], dtype=np.float32)
-        scale = (aw / max(bw, 1))
-        scale = float(np.clip(scale, MIN_FACE_ALIGN_SCALE, MAX_FACE_ALIGN_SCALE))
-        matrix = np.array(
-            [[scale, 0.0, a_center[0] - scale * b_center[0]], [0.0, scale, a_center[1] - scale * b_center[1]]],
-            dtype=np.float32,
-        )
-        aligned = cv2.warpAffine(
-            baby_cropped,
-            matrix,
-            (target_w, target_h),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0),
-        )
-        return aligned, "Used face-based alignment fallback (eye pair not reliable)."
-
-    # Last-resort fallback.
-    if not baby_eyes or not adult_eyes:
-        resized = cv2.resize(baby_cropped, (target_w, target_h), interpolation=cv2.INTER_AREA)
-        return resized, "Eye/face detection failed for baby/adult; used center crop fallback."
-    resized = cv2.resize(baby_cropped, (target_w, target_h), interpolation=cv2.INTER_AREA)
-    return resized, "Used center crop fallback."
+    return normal_fallback, "No eye match found; used normal (non-eye) scaling."
 
 
 def parse_args() -> argparse.Namespace:
