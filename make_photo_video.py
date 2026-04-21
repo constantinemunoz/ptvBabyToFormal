@@ -58,6 +58,7 @@ MAX_FACE_ALIGN_SCALE = 1.20
 MAX_ALIGNMENT_ANGLE_DEG = 15.0
 INTER_SEGMENT_FADE_FRAMES = 10
 BANNER_HEIGHT = 140
+ALIGN_BLACK_SPACE_THRESHOLD = 0.06
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 INDEX_SEP_PATTERN = re.compile(r"\s*(,|\t|\||:|=)\s*")
@@ -118,6 +119,16 @@ class LoopingBackground:
     def release(self) -> None:
         if self.cap is not None:
             self.cap.release()
+
+
+def find_case_insensitive_file(directory: Path, wanted_name: str) -> Optional[Path]:
+    if not directory.exists():
+        return None
+    wanted = wanted_name.lower()
+    for p in directory.iterdir():
+        if p.is_file() and p.name.lower() == wanted:
+            return p
+    return None
 
 
 def write_video_clip(
@@ -229,7 +240,7 @@ def choose_uniform_font_size(names: Sequence[str], max_text_width: int) -> int:
         too_wide = False
         for n in names:
             l, t, r, b = draw.textbbox((0, 0), n, font=font, stroke_width=FONT_STROKE_WIDTH)
-            if (r - l) > max_text_width:
+            if (r - l) > int(max_text_width * 0.98):
                 too_wide = True
                 break
         if too_wide:
@@ -524,6 +535,14 @@ def align_baby_to_adult(
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=(0, 0, 0),
         )
+        black_mask = np.all(aligned < 8, axis=2)
+        black_ratio = float(np.mean(black_mask))
+        if black_ratio > ALIGN_BLACK_SPACE_THRESHOLD:
+            resized = cv2.resize(baby_cropped, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            return (
+                resized,
+                f"Eye alignment introduced {black_ratio*100:.1f}% black space; used non-eye fallback.",
+            )
         if baby_inferred or adult_inferred:
             return aligned, "Used inferred eye points from face boxes (explicit eye detection unavailable)."
         return aligned, f"Aligned using {source} eye detection."
@@ -821,7 +840,8 @@ def draw_name_text(
     probe_draw = ImageDraw.Draw(pil_probe)
     left, top, right, bottom = probe_draw.textbbox((0, 0), name, font=font, stroke_width=FONT_STROKE_WIDTH)
     text_w = max(1, right - left)
-    text_h = max(1, bottom - top)
+    ascent, descent = font.getmetrics() if hasattr(font, "getmetrics") else (text_w, int(text_w * 0.2))
+    text_h = max(1, ascent + descent)
     if banner_rect is None:
         rect_x = 0
         rect_w = WIDTH
@@ -847,14 +867,15 @@ def draw_name_text(
     draw = ImageDraw.Draw(pil_overlay)
     box_w = bottom_right[0] - top_left[0]
     box_h = bottom_right[1] - top_left[1]
-    text_x = top_left[0] + (box_w - text_w) // 2 - left
-    text_y = top_left[1] + (box_h - text_h) // 2 - top
-    shadow_pos = (text_x + SHADOW_OFFSET[0], text_y + SHADOW_OFFSET[1])
-    text_pos = (text_x, text_y)
+    center_x = top_left[0] + box_w // 2
+    center_y = top_left[1] + box_h // 2
+    shadow_pos = (center_x + SHADOW_OFFSET[0], center_y + SHADOW_OFFSET[1])
+    text_pos = (center_x, center_y)
     draw.text(
         shadow_pos,
         name,
         font=font,
+        anchor="mm",
         fill=SHADOW_COLOR[::-1],  # RGB
         stroke_width=FONT_STROKE_WIDTH + 1,
         stroke_fill=STROKE_COLOR[::-1],
@@ -863,6 +884,7 @@ def draw_name_text(
         text_pos,
         name,
         font=font,
+        anchor="mm",
         fill=TEXT_COLOR[::-1],  # RGB
         stroke_width=FONT_STROKE_WIDTH,
         stroke_fill=STROKE_COLOR[::-1],
@@ -1129,15 +1151,16 @@ def main() -> int:
         print("\nNo valid pairs to render. Exiting without creating video.")
         return 2
 
-    FONT_SIZE = choose_uniform_font_size([m.row.name for m in matches], max_text_width=WIDTH - 80)
+    FONT_SIZE = choose_uniform_font_size([m.row.name for m in matches], max_text_width=WIDTH - 240)
 
     writer = create_writer(args.output)
-    background = LoopingBackground(args.images / "background.mov", WIDTH, HEIGHT)
+    background_path = find_case_insensitive_file(args.images, "background.mov") or (args.images / "background.mov")
+    background = LoopingBackground(background_path, WIDTH, HEIGHT)
     if background.cap is None:
         aggregate_warnings.append(
-            f"background.mov was not found/readable at {args.images / 'background.mov'}; using solid background fallback."
+            f"background.mov was not found/readable at {background_path}; using solid background fallback."
         )
-    title_card_path = args.images / "titleCard.mp4"
+    title_card_path = find_case_insensitive_file(args.images, "titleCard.mp4") or (args.images / "titleCard.mp4")
     rendered_matches: List[MatchResult] = []
     previous_adult_fg: Optional[ContainedForeground] = None
     try:
