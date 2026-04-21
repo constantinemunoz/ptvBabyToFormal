@@ -85,6 +85,12 @@ Or just run with defaults (uses `./images`, `./index.txt`, and writes `./final_v
 python make_photo_video.py
 ```
 
+Optional: specify MediaPipe Face Landmarker model file (recommended):
+
+```bash
+python make_photo_video.py --landmarker-model ./face_landmarker.task
+```
+
 ---
 
 ## 5) What matching logic does
@@ -106,11 +112,15 @@ If multiple baby candidates match, the script picks the best deterministically a
 
 - Output: one MP4, 1920x1080, no audio
 - Images are not stretched (aspect ratio preserved)
-- Baby photo is transformed (scale/rotate/shift) to align eye positions with the matched adult photo using OpenCV eye detection; adult photo is not modified
+- Baby photo is transformed (scale/rotate/shift) to align eye positions with the matched adult photo using MediaPipe Face Landmarker eye points (with OpenCV fallbacks); adult photo is not modified
 - Baby photo is center-cropped to the same aspect ratio as its matched adult photo before alignment (no squeeze/stretch)
-- Frame style: centered foreground image over a solid pure-green background (for green-screen/chroma-key workflows)
+- Frame style: centered foreground image over looping `background.mov` from the images folder (falls back if missing)
 - Name text uses Arial Regular (when available) on a semi-transparent black banner with yellow border (`#FCB315`) at the bottom, starting when the baby->adult fade begins
 - For entries missing a baby photo match, the person is still rendered with an adult-only segment (3 seconds, no crossfade), and a warning is included in the summary
+- If `titleCard.mp4` exists in the images folder, it plays once at the beginning and then loops 3 times at the end
+- Adds an additional 10-frame inter-segment cross dissolve from each adult photo to the next person's baby photo
+- Uses a fixed-size black banner with a single yellow top line (no per-name box resizing), centered in the same position each time
+- Uses one uniform font size for all names, chosen so the longest name fits the frame width
 
 ---
 
@@ -156,6 +166,9 @@ If H.264 encoder is unavailable in your OpenCV build, it may fall back to `mp4v`
 
 ### Eye alignment did not happen for some people
 If eye pairs cannot be detected reliably, the script infers eye points from face boxes and still performs alignment. If face detection is also unavailable, it falls back to center-crop + resize (still preserving aspect ratio and no stretching) and logs a warning in the summary.
+
+### Background video not visible
+Place `background.mov` inside your `--images` folder. The script loops it continuously until rendering finishes. If missing/unreadable, it falls back to a solid background and prints a warning.
 
 ---
 
